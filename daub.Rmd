@@ -1,0 +1,364 @@
+---
+title: "Daub analysis"
+author: "Juan-Marco Puerta Schardt"
+date: "2024-11-11"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# packages and data
+```{r}
+library(here) #loading data faster
+library(tidyverse) #cleaning&transforming data
+library(factoextra) #multivariate statistic
+library(FactoMineR) #multivariate statistic
+library(ggraph)
+#own functions
+source(here("RFA-Functions.R"))
+
+```
+
+
+##loading the data
+```{r}
+daub_rfa <- read.csv2(here("data/RFA 2808-2835.csv"))
+
+daub_rfa <- read.csv2(here("data/RFA 2836-2866.csv")) |> 
+  rbind(daub_rfa)
+
+daub_pro <- read.csv2(here("data/daub_protocoll.csv"))
+```
+
+Merging the protocoll with the rfa data and creating a new csv with the rawdata of the measurements.
+```{r}
+daub_pro <- daub_pro |> 
+  filter(Nr %in% daub_rfa$Reading.No) |> 
+  filter(N_Measurements != 0)
+
+daub_rfa <- daub_pro |> 
+  left_join(daub_rfa, by = c("Nr" = "Reading.No"))|> 
+  filter(!is.na(User.Login)) |> 
+  dplyr::select_if(~ !all(is.na(.)))
+
+daub_rfa |> 
+  write.csv2("data/daub_raw_data.csv")
+```
+
+# data cleaning
+## measurement error
+```{r}
+d.val <- daub_rfa |> 
+  dplyr::select(Nr,10:103) |> 
+  dplyr::select(-contains(".Error")) |> 
+  column_to_rownames("Nr") |> 
+  mutate(across(everything(), ~ ifelse(grepl("<LOD", .), 0, as.character(.)))) |> 
+  mutate_all(funs(str_replace_all(., ",", "\\."))) |> 
+  mutate_all(as.numeric)  
+
+
+d.error <- daub_rfa |> 
+ # dplyr::select(Nr,15:106) |> 
+  dplyr::select(Nr,contains(".Error"))|> 
+  column_to_rownames("Nr")
+```
+The following code gives out the error margin of the measurements by percentage. This are the error marging the pxrf herself calculates. The table showing the error margin can help to understand, if an element is suitable for analysis or if the pXRF cant detect it properly.
+```{r}
+d.error_prop <- d.error/d.val*100 
+
+
+d.error_prop[d.error_prop == Inf] <- NA
+
+error_summary <- d.error_prop %>%
+  summarise(across(everything(), list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE), median = ~median(.x, na.rm = TRUE)))) %>%
+  pivot_longer(cols = everything(),
+               names_to = c("Element", "variable"), 
+               names_pattern = "(.*)_(.*)")
+
+
+error_summary |> 
+  filter(variable == "median") |> 
+  #filter(value < 20) |> 
+  arrange(value) |> 
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |> 
+  print()
+
+daub.low.error.elements_25 <- error_summary |> 
+  filter(variable == "median") |> 
+  filter(value < 25) |> 
+  arrange(value) |> 
+  mutate(Element = str_extract(Element, "^[A-Za-z]+")) |> 
+  filter(Element != "Bal") |> pull(Element) 
+
+daub.low.error.elements_25
+```
+
+## calibration
+Based on samples measured by Dr. Helfert (GU Ffm) with both pXRF and WD-XRF, the results of the pXRF are calibrated.
+```{r}
+calib_mean <- read.csv2(here("data/calib_mean.csv")) |> 
+  dplyr::select(-Position)
+
+calib_aim <- read.csv2(here("data/calib_aim.csv")) |> 
+  dplyr::select(-Probe)
+
+calib_mean <- calib_mean |>  
+  dplyr::select(all_of(intersect(names(calib_aim), names(calib_mean)))) 
+
+calib_aim <- calib_aim|>  
+  dplyr::select(all_of(intersect(names(calib_aim), names(calib_mean)))) 
+
+```
+
+```{r}
+models <- list()
+
+# Durchführung der linearen Regression für jede Spalte
+for (col in names(calib_aim)) {
+  # Kombiniere die Kalibrations- und Testdaten
+  data <- data.frame(y = calib_mean[[col]], x = calib_aim[[col]])
+  # Erstelle das lineare Modell
+  model <- lm(y ~ x, data = data)
+  models[[col]] <- model
+    correlation <- cor.test(data$y, data$x)
+ cat("Korrelation und pvlaue für Spalte", col, ":", correlation$estimate,"&", correlation$p.value, "\n")
+ }
+
+# Modelle anzeigen
+print(models)
+
+
+calibrate_data <- function(new_data, models) {
+  calibrated_data <- new_data
+  for (col in names(new_data)) {
+    if (col %in% names(models)) {
+      model <- models[[col]]
+      intercept <- coef(model)[1]
+      slope <- coef(model)[2]
+      # Anwenden der Kalibrierungsgleichung: y = slope * x + intercept
+      calibrated_data[[col]] <- slope * new_data[[col]] + intercept
+    }
+  }
+  return(calibrated_data)
+}
+
+# Anwendung der Modelle auf das neue DataFrame
+calibrated_data <- calibrate_data(calib_mean, models)
+
+# Kalibriertes DataFrame anzeigen
+print(calibrated_data)
+
+```
+
+```{r}
+d.val <- calibrate_data(d.val, models)
+```
+
+
+## sd per object
+Because of the matrix is often irregular and the tool has imprecision, the values of measurements on a single sherd can differ. Checking them out and filtering outliers can help to get a better understanding of and smoother data.
+```{r}
+d.sd <- cbind(daub_pro, d.val) |> 
+  group_by(Object) |> 
+  summarise(across(where(is.numeric), ~sd(.x, na.rm = TRUE)),
+            across(where(is.character), ~first(.x)))
+```
+
+the plots below show the values of the elements for the measurements on each sherd.
+```{r}
+cbind(daub_pro, d.val) |> 
+   select(Object, all_of(daub.low.error.elements_25)) |>
+  pivot_longer(-Object, names_to = "Element") |> 
+  ggplot(aes(x = Object, y = value))+
+  geom_point()+
+  facet_wrap(~Element)
+
+cbind(daub_pro, d.val) |> 
+   select(Object, Si, Al, Ca) |>
+  pivot_longer(-Object, names_to = "Element") |> 
+  ggplot(aes(x = Object, y = value))+
+  geom_point()+
+  facet_wrap(~Element)
+
+cbind(daub_pro, d.val) |> 
+     select(Object, Fe, K) |>
+  pivot_longer(-Object, names_to = "Element") |> 
+  ggplot(aes(x = Object, y = value))+
+  geom_point()+
+  facet_wrap(~Element)
+
+
+
+cbind(daub_pro, d.val) |> 
+   select(Object, all_of(daub.low.error.elements_25)) |>
+       select(-Si,-Al, -Fe, -K) |>
+  pivot_longer(-Object, names_to = "Element") |> 
+  ggplot(aes(x = Object, y = value))+
+  geom_point()+
+  facet_wrap(~Element)
+```
+
+
+## removing outliers
+```{r}
+d.val2 <- cbind(daub_pro, d.val) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+            across(where(is.character), first))
+
+# Berechnung des Mittelwerts ohne für numerische Spalten und Beibehalten des ersten Werts für nicht-numerische Spalten
+d.val <- cbind(daub_pro, d.val) |> 
+  filter(Object != "Standart-TS") |> 
+  group_by(Object) |> 
+  summarise(across(where(is.numeric), remove_outliers_and_calculate_mean),
+            across(where(is.character), first)) 
+
+
+```
+
+```{r}
+compare_dataframes(d.val, d.val2)
+
+```
+
+## main elements
+```{r}
+  
+main_elements <- c("Si", "Al", "Ca", "K", "Fe", "Ti", "P", "Mn")
+
+colnames(d.val |> 
+  select_if(is.numeric) |> 
+select_if(~ mean(., na.rm = TRUE) >= 1000)) 
+
+
+
+
+d.ME <- d.val |> 
+  dplyr::select(all_of(main_elements)) |> 
+ # select(-Mg) |> 
+  mutate(Si = Si*2.1392,
+         Al = Al*1.8895,
+         Ca = Ca*1.3992,
+         K = K*1.2046,
+         Fe = Fe*1.4297,
+      #   S = S*2.4972, #rausnehmen
+         Ti = Ti*1.6681,
+         P = 2.2916,
+       Mn = 1.5825
+         )
+
+
+  df_long <- d.ME %>%
+  rownames_to_column(var = "row_id") %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "value")
+
+# Berechnen Sie die Summe jeder Zeile und fügen Sie sie hinzu
+df_long <- df_long %>%
+  group_by(row_id) %>%
+  mutate(row_sum = sum(value)) %>%
+  ungroup()
+
+# Berechnen Sie die Prozente
+df_long <- df_long %>%
+  mutate(percent = (value / row_sum) * 100)
+
+# Konvertieren Sie zurück in das breite Format
+d.ME <- df_long %>%
+  dplyr::select(row_id, variable, percent) %>%
+  pivot_wider(names_from = "variable", values_from = "percent") %>%
+  column_to_rownames(var = "row_id")
+
+#colnames(RFA.ME) <- main_elements$Oxide
+```
+
+```{r}
+d_save <- d.val
+
+
+d.val <- d.val |> 
+  dplyr::select(-all_of(main_elements)) |> 
+  cbind(d.ME) |> 
+  dplyr::select(colnames(daub_pro),all_of(main_elements), everything())
+
+d.val <- d.val |> 
+  remove_rownames()
+
+elements_all <- colnames(select(d.val, Si:Cl))
+```
+
+# analysis
+## biplots
+```{r}
+d.val |> 
+  ggplot(aes(x = Si, y = Ca))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Si, y = Fe))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Ca, y = Fe))+
+  geom_label(aes(label = Object))
+
+
+d.val |> 
+  ggplot(aes(x = Ca, y = 1))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Si, y = 1))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Ca, y = Sr))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Al, y = Fe))+
+  geom_label(aes(label = Object))
+
+d.val |> 
+  ggplot(aes(x = Cr, y = K))+
+  geom_label(aes(label = Object))
+```
+##pca
+###pca all elements
+```{r}
+d.val |> 
+  column_to_rownames("Object") |> 
+  dplyr::select(elements_all) |> 
+  dplyr::select(all_of(daub.low.error.elements_25)) |> 
+  PCA()
+```
+
+###pca main elements
+```{r}
+d.val |> 
+  column_to_rownames("Object") |> 
+  dplyr::select(elements_all) |> 
+  dplyr::select(all_of(main_elements)) |> 
+  PCA()
+```
+###pca elements with geolocial significance 
+Al -> Laterite
+Ti & Fe -> Iron
+Zr -> Sand
+Cr -> Clay # not used because of large scatter
+Si & Ca -> Sponges spicules
+K & Rb -> feldspar component
+Sr -> calcite component
+P -> Organic; withers for surface pottery
+
+!!! write source
+
+```{r}
+d.val |> 
+  column_to_rownames("Object") |> 
+  dplyr::select(elements_all) |> 
+  dplyr::select(Al, Ti, Fe, Zr, Si, Ca, K, Rb, Sr, P) |> 
+  PCA()
+```
